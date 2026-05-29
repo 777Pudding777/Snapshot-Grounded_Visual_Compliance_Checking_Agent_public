@@ -1,0 +1,69 @@
+{
+  "description": "Rule set represented by the uploaded evaluation traces.",
+  "sourceRuleLibrary": "src/data/ruleLibrary.json",
+  "sceneDirectories": [
+    "evaluation/scenes/ifc",
+    "evaluation/scenes/revit"
+  ],
+  "rules": [
+    {
+      "id": "VLM-ACC-RAMP-001",
+      "title": "207 Accessible Ramp Rule",
+      "sceneGroup": "207_ramp",
+      "traceCount": 8
+    },
+    {
+      "id": "VLM-ACC-DOOR-001",
+      "title": "208 Accessible Door Rule",
+      "sceneGroup": "208_door",
+      "traceCount": 11
+    },
+    {
+      "id": "VLM-ACC-FLOOR-001",
+      "title": "209 Free Floor Space",
+      "sceneGroup": "209_free_floor_space",
+      "traceCount": 7
+    },
+    {
+      "id": "VLM-ACC-STAIR-001",
+      "title": "210 Accessible Stair Rule",
+      "sceneGroup": "210_stairs",
+      "traceCount": 11
+    },
+    {
+      "id": "VLM-ACC-WINDOW-001",
+      "title": "211 Accessible Window Rule",
+      "sceneGroup": "211_window",
+      "traceCount": 7
+    },
+    {
+      "id": "VLM-MAINT-FRONT-001",
+      "title": "226 Free Area in Front of Components",
+      "sceneGroup": "226_free_area_in_front_of_component",
+      "traceCount": 6
+    },
+    {
+      "id": "VLM-SAFE-GUARD-001",
+      "title": "236 Guarding Against Falling",
+      "sceneGroup": "236_guarding_against_falling",
+      "traceCount": 18
+    },
+    {
+      "id": "VLM-CIRC-WIDTH-001",
+      "title": "247 Local Accessible Circulation Rule",
+      "sceneGroup": "247_corridor",
+      "traceCount": 8
+    }
+  ],
+  "totals": {
+    "rules": 8,
+    "traces": 76,
+    "ifcScenes": 28,
+    "revitScenes": 26
+  },
+  "notes": [
+    "Rule ids and titles are taken from trace.rule in the uploaded JSON traces.",
+    "Trace counts include binary mode, conservative mode, and case-study traces.",
+    "The full rule definitions remain in src/data/ruleLibrary.json; this file is a compact evaluation manifest."
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "providerGateway": "openrouter",
+  "description": "Models represented in the uploaded evaluation traces.",
+  "models": [
+    {
+      "id": "anthropic/claude-sonnet-4.6",
+      "label": "Claude Sonnet 4.6",
+      "provider": "Anthropic",
+      "traceCounts": {
+        "binaryMode": 33,
+        "conservativeMode": 8,
+        "caseStudy": 2,
+        "total": 43
+      }
+    },
+    {
+      "id": "openai/gpt-5.4",
+      "label": "GPT-5.4",
+      "provider": "OpenAI",
+      "traceCounts": {
+        "binaryMode": 27,
+        "conservativeMode": 1,
+        "caseStudy": 1,
+        "total": 29
+      }
+    },
+    {
+      "id": "openai/gpt-5.5",
+      "label": "GPT-5.5",
+      "provider": "OpenAI",
+      "traceCounts": {
+        "binaryMode": 1,
+        "conservativeMode": 0,
+        "caseStudy": 0,
+        "total": 1
+      },
+      "notes": "Present in one GPT folder trace/report pair for the 211B window evaluation."
+    },
+    {
+      "id": "moonshotai/kimi-k2.5",
+      "label": "Kimi K2.5",
+      "provider": "Moonshot AI",
+      "traceCounts": {
+        "binaryMode": 3,
+        "conservativeMode": 0,
+        "caseStudy": 0,
+        "total": 3
+      }
+    }
+  ],
+  "notes": [
+    "Model ids are taken from trace.model.id in the uploaded evaluation JSON traces.",
+    "Provider labels are normalized for readability; the trace files record the gateway provider as openrouter.",
+    "No API credentials are included in this file."
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "Conservative evaluation mode",
+  "description": "Configuration snapshot for traces and reports stored under evaluation/reports/2_conservative_mode.",
+  "reportDirectory": "evaluation/reports/2_conservative_mode",
+  "traceCount": 9,
+  "reasoningMode": "legacy_conservative",
+  "traceReasoningModeValue": null,
+  "allowedVerdicts": ["PASS", "FAIL", "UNCERTAIN"],
+  "modelsEvaluated": [
+    "anthropic/claude-sonnet-4.6",
+    "openai/gpt-5.4"
+  ],
+  "runtimeSettings": {
+    "maxComplianceSteps": 5,
+    "maxSnapshotsPerRequest": 5,
+    "useCompactVlmContext": true,
+    "planCutFollowUpsEnabled": false
+  },
+  "notes": [
+    "The conservative-mode traces are older exports where trace.reasoningMode is not populated.",
+    "The mode label is inferred from the evaluation/reports/2_conservative_mode folder and the evaluation setup.",
+    "This mode preserves inconclusive outcomes instead of forcing every final answer into PASS or FAIL."
+  ]
+}

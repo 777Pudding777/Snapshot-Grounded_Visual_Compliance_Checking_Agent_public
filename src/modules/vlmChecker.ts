@@ -1,0 +1,1262 @@
+// src/modules/vlmChecker.ts
+// VLM Checker: takes snapshots (multi-view evidence window) + rule prompt and returns a structured decision.
+//
+// Design decisions:
+// - Strict structured output (verdict/confidence/followUp) for reproducibility.
+// - Adapter interface keeps provider changes away from UI and navigation code.
+// - Separation of concerns:
+//   - Navigation computes geometry/visibility metrics (projectedAreaRatio/occlusionRatio/etc).
+//   - VLM reasons semantically over what is visible and uses nav metrics as authoritative.
+
+import type { SnapshotArtifact } from "./snapshotCollector";
+import {
+  DEFAULT_TAVILY_MAX_CHARS,
+  getPrototypeRuntimeSettings,
+} from "../config/prototypeSettings";
+import type { EvidenceRequirementsStatus } from "../types/evidenceRequirements.types";
+import {
+  assessPromptRegulatoryGrounding,
+  buildRegulatoryContextBlock,
+  hasExplicitRegulatoryGapText,
+  inferPromptSource,
+} from "./regulatoryContext";
+
+const DEFAULT_ALLOWED_DOMAINS = ["codes.iccsafe.org"];
+const WEB_FETCH_PROXY_BASE_URL =
+  import.meta.env.VITE_WEB_FETCH_PROXY_URL ?? ""; // configured through the Vite env file
+
+import { webFetchViaProxy } from "./vlmAdapters/tools/webFetch";
+import {
+  isTavilyAvailable,
+  searchRuleContext,
+  webFetchViaTavily,
+} from "./vlmAdapters/tools/tavilySearch";
+import type { WebEvidenceRecord } from "../types/trace.types";
+import type { ComplianceReasoningMode } from "../types/reasoning.types";
+import { normalizeComplianceReasoningMode } from "../types/reasoning.types";
+import { reduceRegulatoryTextWithOpenRouter } from "./regulatoryReducer";
+
+// Web fetching tools.
+type ReducerProviderConfig =
+  | { provider: "mock" }
+  | {
+      provider: "openrouter";
+      openrouter: {
+        apiKey?: string;
+        model?: string;
+        endpoint?: string;
+        requestTimeoutMs?: number;
+        appTitle?: string;
+        appReferer?: string;
+      };
+    }
+  | {
+      provider: "openai";
+      openai: {
+        apiKey?: string;
+        model?: string;
+        endpoint?: string;
+        requestTimeoutMs?: number;
+      };
+    };
+
+export type VlmVerdict = "PASS" | "FAIL" | "UNCERTAIN";
+export type VlmEvidenceSupportLabel =
+  | "OBSERVED_PASS"
+  | "OBSERVED_FAIL"
+  | "ASSUMED_PASS"
+  | "ASSUMED_FAIL"
+  | "NOT_EVALUATED";
+
+export type VlmEvidenceGapClassification = {
+  notEvaluated: string[];
+  outOfScope: string[];
+  weaklySupported: string[];
+};
+
+export type ViewPreset = "TOP" | "ISO" | "ORBIT";
+
+export type VlmFollowUp =
+  // Generic request for another view; the orchestrator decides how.
+  | { request: "NEW_VIEW"; params?: { reason?: string } }
+
+  // View controls
+  | { request: "SET_VIEW_PRESET"; params: { preset: ViewPreset } }
+  | { request: "TOP_VIEW" } // backwards-compatible alias
+  | { request: "ISO_VIEW" } // backwards-compatible alias
+  | { request: "ORBIT"; params: { degrees?: number; yawDegrees?: number; pitchDegrees?: number; reason?: string } }
+  | { request: "ORBIT_90"; params?: { direction?: "left" | "right"; reason?: string } }
+  | { request: "ORBIT_180"; params?: { reason?: string } }
+  | { request: "ZOOM_IN"; params?: { factor?: number } }
+
+  // Scope tools (context)
+  | { request: "ISOLATE_STOREY"; params: { storeyId: string } }
+  | { request: "ISOLATE_SPACE"; params: { spaceId: string } }
+
+  // Relevance filtering / visibility edits
+  // ISOLATE_CATEGORY is kept out of the VLM/runtime contract for now.
+  // The category action remains available only in local tree UI workflows.
+  // | { request: "ISOLATE_CATEGORY"; params: { category: string } }
+  | { request: "HIDE_IDS"; params: { ids: string[]; reason?: string } }
+  | { request: "SHOW_IDS"; params: { ids: string[] } }
+  | { request: "RESET_VISIBILITY" }
+
+  // Category visibility toggles
+| { request: "HIDE_CATEGORY"; params: { category: string; reason?: string } }
+| { request: "SHOW_CATEGORY"; params: { category: string } }
+| { request: "PICK_CENTER"; params?: { reason?: string } }
+
+// Object interaction
+  | { request: "PICK_OBJECT"; params: { x: number; y: number } } // screen coords
+  | { request: "GET_PROPERTIES"; params: { objectId: string } }
+  | { request: "HIGHLIGHT_IDS"; params: { ids: string[]; style?: "primary" | "warn" } }
+  | { request: "HIDE_SELECTED" }
+
+  | { request: "SET_PLAN_CUT"; params: { height: number; thickness?: number; mode?: "WORLD_UP" | "CAMERA" } }
+  | { request: "SET_STOREY_PLAN_CUT"; params: { storeyId: string; offsetFromFloor?: number; mode?: "WORLD_UP" | "CAMERA" } }
+  | { request: "CLEAR_PLAN_CUT" }
+  | { request: "RESTORE_VIEW"; params: { step?: number; snapshotId?: string; bookmarkId?: string } }
+
+// Internal tool-like step: fetch authoritative code text through the allowlisted proxy.
+  | { request: "WEB_FETCH"; params: { url: string; maxChars?: number; selector?: string; focus?: { contains?: string[]; windowChars?: number } } };
+
+export type VlmDecision = {
+  decisionId: string;
+  timestampIso: string;
+
+  verdict: VlmVerdict;
+  confidence: number; // 0..1
+
+  rationale: string;
+  /** Explicit high-level evidence gaps reported by the VLM */
+  missingEvidence?: string[];
+  /**
+   * Generalized evidence-requirement status reported by the VLM.
+   * The runtime planner may combine this with deterministic viewer context
+   * before choosing the next follow-up action.
+   */
+  evidenceRequirementsStatus?: EvidenceRequirementsStatus;
+
+  // Geometry should be grounded in navigation metrics when they are present.
+  visibility: {
+    isRuleTargetVisible: boolean;
+    occlusionAssessment: "LOW" | "MEDIUM" | "HIGH";
+    missingEvidence?: string[];
+  };
+
+  evidence: {
+    snapshotIds: string[]; // IDs from SnapshotArtifact.id (subset of input artifacts, stable order)
+    mode: SnapshotArtifact["mode"];
+    note?: string;
+  };
+
+  followUp?: VlmFollowUp;
+
+  // Helpful for experiments / reproducibility
+  meta: {
+    modelId: string | null;
+    promptHash: string;
+    provider: string; // for example, "mock", "openai", or "openrouter"
+    followUpSource?: "model" | "provider_override" | "default_fallback";
+    /**
+     * Prompt assembled in vlmChecker after regulatory-context injection.
+     * This is the text passed into adapter.check(...).
+     */
+    composedPromptText?: string;
+    /**
+     * Final adapter-level prompt payload, if adapter wraps the composed prompt
+     * (e.g. OpenRouter wrapPromptBase with system rubric + evidence index).
+     */
+    adapterPromptText?: string;
+    /** Exact snapshot ids passed into this VLM call before the model responded */
+    inputSnapshotIds?: string[];
+    tokenUsage?: {
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+    };
+    promptContextStats?: {
+      fullContextChars: number;
+      compactContextChars: number;
+      snapshotCount: number;
+      compactModeEnabled: boolean;
+      usedCompactContext: boolean;
+      fullFallbackSnapshotIds?: string[];
+    };
+    /** Exact evidence views sent to the VLM for this decision (compact or full, depending on runtime mode). */
+    promptEvidenceViews?: EvidenceView[];
+    taskPromptMode?: "full_rule_text" | "compact_follow_up_summary";
+    reasoningMode?: ComplianceReasoningMode;
+    /**
+     * Binary mode keeps final verdicts PASS/FAIL for output comparability, but
+     * preserves whether the model actually observed enough evidence or forced
+     * a binary answer from an internally uncertain state.
+     */
+    evidenceSupportLabel?: VlmEvidenceSupportLabel;
+    rawVerdictBeforeBinaryCoercion?: VlmVerdict;
+    evidenceGapClassification?: VlmEvidenceGapClassification;
+  };
+};
+
+export type VlmAdapterDecision = Omit<VlmDecision, "decisionId" | "timestampIso" | "meta"> & {
+  meta: Omit<VlmDecision["meta"], "promptHash"> & { promptHash?: string };
+};
+
+export type NavigationMetrics = {
+  projectedAreaRatio?: number; // 0..1 visible content fraction (nav computes)
+  occlusionRatio?: number; // 0..1 (nav computes)
+  convergenceScore?: number; // computed by navigation when available
+};
+
+export type EvidenceView = {
+  snapshotId: string;
+  mode: SnapshotArtifact["mode"];
+  note?: string;
+  nav?: NavigationMetrics; // visibility metrics from navigation
+  context?: any;           // runner-attached evidence context, such as pose, scope, and hidden IDs
+};
+
+export type VlmCheckInput = {
+  prompt: string; // deterministic prompt payload
+  artifacts: SnapshotArtifact[]; // multi-view evidence window (ordered)
+  evidenceViews: EvidenceView[]; // parallel structured evidence (same ordering)
+  reasoningMode?: ComplianceReasoningMode;
+};
+
+export type VlmAdapter = {
+  name: string;
+  check: (input: VlmCheckInput) => Promise<VlmAdapterDecision>;
+};
+
+export function hashPrompt(s: string) {
+  // Small deterministic hash for logging; stable, not cryptographic.
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `fnv1a_${(h >>> 0).toString(16)}`;
+}
+
+function clamp01(x: number) {
+  return Math.max(0, Math.min(1, x));
+}
+
+function isFollowUp(x: any): x is VlmFollowUp {
+  if (!x || typeof x !== "object") return false;
+
+  const req = x.request;
+
+  switch (req) {
+    case "NEW_VIEW":
+      return !x.params || typeof x.params === "object";
+
+    case "ISO_VIEW":
+    case "TOP_VIEW":
+      return true;
+
+    case "SET_VIEW_PRESET":
+      return (
+        x.params &&
+        (x.params.preset === "TOP" || x.params.preset === "ISO" || x.params.preset === "ORBIT")
+      );
+
+    case "ORBIT":
+      return (
+        x.params &&
+        typeof x.params === "object" &&
+        (x.params.degrees === undefined || (typeof x.params.degrees === "number" && isFinite(x.params.degrees))) &&
+        (x.params.yawDegrees === undefined || (typeof x.params.yawDegrees === "number" && isFinite(x.params.yawDegrees))) &&
+        (x.params.pitchDegrees === undefined || (typeof x.params.pitchDegrees === "number" && isFinite(x.params.pitchDegrees))) &&
+        (x.params.reason === undefined || typeof x.params.reason === "string") &&
+        (x.params.degrees !== undefined || x.params.yawDegrees !== undefined || x.params.pitchDegrees !== undefined)
+      );
+
+    case "ORBIT_90":
+      return (
+        !x.params ||
+        (typeof x.params === "object" &&
+          (x.params.direction === undefined || x.params.direction === "left" || x.params.direction === "right") &&
+          (x.params.reason === undefined || typeof x.params.reason === "string"))
+      );
+
+    case "ORBIT_180":
+      return (
+        !x.params ||
+        (typeof x.params === "object" &&
+          (x.params.reason === undefined || typeof x.params.reason === "string"))
+      );
+
+    case "ZOOM_IN":
+      return (
+        !x.params ||
+        (typeof x.params === "object" &&
+          (x.params.factor === undefined ||
+            (typeof x.params.factor === "number" && isFinite(x.params.factor))))
+      );
+
+    // case "ISOLATE_CATEGORY":
+    //   return x.params && typeof x.params.category === "string" && x.params.category.length > 0;
+
+    case "ISOLATE_STOREY":
+      return x.params && typeof x.params.storeyId === "string" && x.params.storeyId.length > 0;
+
+    case "ISOLATE_SPACE":
+      return x.params && typeof x.params.spaceId === "string" && x.params.spaceId.length > 0;
+
+    case "HIDE_IDS":
+      return (
+        x.params &&
+        Array.isArray(x.params.ids) &&
+        x.params.ids.every((id: any) => typeof id === "string") &&
+        (x.params.reason === undefined || typeof x.params.reason === "string")
+      );
+
+    case "SHOW_IDS":
+      return x.params && Array.isArray(x.params.ids) && x.params.ids.every((id: any) => typeof id === "string");
+
+    case "RESET_VISIBILITY":
+      return true;
+
+    case "PICK_OBJECT":
+      return (
+        x.params &&
+        typeof x.params.x === "number" &&
+        typeof x.params.y === "number" &&
+        isFinite(x.params.x) &&
+        isFinite(x.params.y)
+      );
+
+    case "GET_PROPERTIES":
+      return x.params && typeof x.params.objectId === "string" && x.params.objectId.length > 0;
+
+    case "HIGHLIGHT_IDS":
+      return (
+        x.params &&
+        Array.isArray(x.params.ids) &&
+        x.params.ids.every((id: any) => typeof id === "string") &&
+        (x.params.style === undefined || x.params.style === "primary" || x.params.style === "warn")
+      );
+    case "WEB_FETCH":
+      return (
+        x.params &&
+        typeof x.params.url === "string" &&
+        x.params.url.length > 0 &&
+        (x.params.maxChars === undefined || (typeof x.params.maxChars === "number" && isFinite(x.params.maxChars))) &&
+        (x.params.selector === undefined || typeof x.params.selector === "string")
+      );
+
+    case "HIDE_SELECTED":
+    case "HIDE_CATEGORY":
+    case "SHOW_CATEGORY":
+    case "PICK_CENTER":
+    case "CLEAR_PLAN_CUT":
+      return true;
+
+    case "SET_PLAN_CUT":
+      return (
+        x.params &&
+        typeof x.params.height === "number" &&
+        isFinite(x.params.height) &&
+        (x.params.thickness === undefined || (typeof x.params.thickness === "number" && isFinite(x.params.thickness))) &&
+        (x.params.mode === undefined || x.params.mode === "WORLD_UP" || x.params.mode === "CAMERA")
+      );
+
+    case "SET_STOREY_PLAN_CUT":
+      return (
+        x.params &&
+        typeof x.params.storeyId === "string" &&
+        x.params.storeyId.length > 0 &&
+        (x.params.offsetFromFloor === undefined || (typeof x.params.offsetFromFloor === "number" && isFinite(x.params.offsetFromFloor))) &&
+        (x.params.mode === undefined || x.params.mode === "WORLD_UP" || x.params.mode === "CAMERA")
+      );
+
+    case "RESTORE_VIEW":
+      return (
+        x.params &&
+        (x.params.step === undefined || (typeof x.params.step === "number" && isFinite(x.params.step))) &&
+        (x.params.snapshotId === undefined || typeof x.params.snapshotId === "string") &&
+        (x.params.bookmarkId === undefined || typeof x.params.bookmarkId === "string")
+      );
+
+    default:
+      return false;
+  }
+}
+
+function extractAllowedDomainsFromPrompt(p: string): string[] | null {
+  const m = p.match(/AllowedSources:\s*([\s\S]*?)(\n\n|$)/i);
+  if (!m) return null;
+
+  const block = m[1];
+  const lines = block
+    .split("\n")
+    .map((l) => l.replace(/^\s*-\s*/, "").trim())
+    .filter(Boolean);
+
+  const domains: string[] = [];
+  for (const raw of lines) {
+    // Accept both full URLs and plain hostnames
+    const candidate = raw.includes("://") ? raw : `https://${raw}`;
+    try {
+      const host = new URL(candidate).hostname.toLowerCase();
+      if (host) domains.push(host);
+    } catch {
+      // ignore invalid entries
+    }
+  }
+
+  const uniq = Array.from(new Set(domains));
+  return uniq.length ? uniq : null;
+}
+
+function composePromptWithRegulatoryContext(args: {
+  userIntent: string;
+  regulatoryContext: string;
+  allowedDomains: string[];
+  promptSource: "rule_library" | "custom_user_prompt" | "unknown";
+  }): string {
+  const allowedLines = args.allowedDomains.map((d) => `- https://${d}`).join("\n");
+  const regulatoryBlock = buildRegulatoryContextBlock({
+    prompt: args.userIntent,
+    regulatoryContext: args.regulatoryContext,
+  });
+
+  if (
+    import.meta.env.DEV &&
+    args.promptSource === "rule_library" &&
+    assessPromptRegulatoryGrounding(args.userIntent).hasUsableLocalGrounding
+  ) {
+    console.assert(
+      !/\(none yet; fetch if needed\)/i.test(regulatoryBlock),
+      "[ruleLibrary] grounded predefined prompt should not emit REGULATORY_CONTEXT: none"
+    );
+  }
+
+  return (
+    "USER_INTENT:\n" +
+    args.userIntent +
+    "\n\n" +
+    "AllowedSources:\n" +
+    allowedLines +
+    "\n\n" +
+    "REGULATORY_CONTEXT:\n" +
+    regulatoryBlock +
+    "\n"
+  );
+}
+
+function guessIccEntrypointUrl(userIntent: string, allowedDomains: string[]): string | null {
+  // Deterministic ICC entrypoint fallback for common IBC editions.
+  const s = (userIntent ?? "").toLowerCase();
+  const iccAllowed = allowedDomains.some(d => d === "codes.iccsafe.org" || d.endsWith(".iccsafe.org"));
+  if (!iccAllowed) return null;
+
+  if (s.includes("ibc") && s.includes("2018")) return "https://codes.iccsafe.org/content/IBC2018P6";
+  if (s.includes("ibc") && s.includes("2021")) return "https://codes.iccsafe.org/content/IBC2021P2";
+  // Keep the edition mapping intentionally small for now.
+
+  return "https://codes.iccsafe.org";
+}
+
+function normalizeInput(input: VlmCheckInput): VlmCheckInput {
+  const artifacts = Array.isArray(input.artifacts) ? input.artifacts : [];
+  // Refuse empty evidence windows before reaching provider-specific adapters.
+  if (artifacts.length === 0) {
+    throw new Error("VlmCheckInput.artifacts must include at least one SnapshotArtifact.");
+  }
+
+  const views = Array.isArray(input.evidenceViews) ? input.evidenceViews : [];
+
+  // EvidenceViews should stay parallel to artifacts; synthesize missing entries deterministically.
+  if (views.length !== artifacts.length) {
+  const synthesized: EvidenceView[] = artifacts.map(a => ({
+  snapshotId: a.id,
+  mode: a.mode,
+  note: a.meta?.note,
+  nav: undefined,
+  context: (a.meta as any)?.context, // best-effort carry from snapshot metadata
+  }));
+
+    // If some views exist, keep them in order for the overlapping prefix; fill the rest.
+    const min = Math.min(views.length, synthesized.length);
+    for (let i = 0; i < min; i++) {
+      const v = views[i];
+      synthesized[i] = {
+        snapshotId: typeof v?.snapshotId === "string" ? v.snapshotId : artifacts[i].id,
+        mode: (v?.mode as any) ?? artifacts[i].mode,
+        note: v?.note ?? artifacts[i].meta?.note,
+        nav: v?.nav,
+        context: (v as any)?.context ?? (artifacts[i].meta as any)?.context,
+      };
+    }
+
+    return { ...input, artifacts, evidenceViews: synthesized };
+  }
+
+  return { ...input, artifacts, evidenceViews: views };
+}
+
+function hasUnresolvedEvidence(core: VlmAdapterDecision): boolean {
+  const missingEvidence = [
+    ...normalizeEvidenceItems((core as any).missingEvidence),
+    ...normalizeEvidenceItems(core.visibility?.missingEvidence),
+  ].filter(Boolean);
+  if (missingEvidence.length > 0) return true;
+  if (core.followUp) return true;
+
+  const status = (core as any).evidenceRequirementsStatus;
+  if (!status || typeof status !== "object") return false;
+
+  return (
+    status.targetVisible === false ||
+    status.targetFocused === false ||
+    status.planMeasurementReady === false ||
+    status.contextViewReady === false ||
+    status.occlusionProblem === true ||
+    status.lowNoveltyOrRepeatedView === true ||
+    status.regulatoryClauseNeeded === true ||
+    status.dimensionReferenceNeeded === true ||
+    status.obstructionContextNeeded === true ||
+    status.bothSidesOrSurroundingsNeeded === true
+  );
+}
+
+function normalizeEvidenceItems(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter(Boolean).map((item) => String(item))
+    : [];
+}
+
+function classifyEvidenceGaps(core: VlmAdapterDecision): VlmEvidenceGapClassification | undefined {
+  const missingEvidence = Array.from(
+    new Set([
+      ...normalizeEvidenceItems((core as any).missingEvidence),
+      ...normalizeEvidenceItems(core.visibility?.missingEvidence),
+    ])
+  );
+  if (!missingEvidence.length) return undefined;
+
+  const outOfScope: string[] = [];
+  const notEvaluated: string[] = [];
+  const weaklySupported: string[] = [];
+
+  for (const item of missingEvidence) {
+    const normalized = item.toLowerCase();
+    if (/\b(out of scope|not in scope|not configured|not applicable|not represented|not visually represented|not part of|outside configured)\b/.test(normalized)) {
+      outOfScope.push(item);
+    } else if (/\b(not evaluated|not assessed|not checked|unavailable)\b/.test(normalized)) {
+      notEvaluated.push(item);
+    } else {
+      weaklySupported.push(item);
+    }
+  }
+
+  return { notEvaluated, outOfScope, weaklySupported };
+}
+
+function finalizeDecision(
+  core: VlmAdapterDecision,
+  input: VlmCheckInput,
+  provider: string
+  ): VlmDecision {
+  const reasoningMode = normalizeComplianceReasoningMode(input.reasoningMode);
+  const allowedIds = input.artifacts.map(a => a.id);
+  const allowed = new Set(allowedIds);
+
+  // Evidence IDs must refer to the provided artifacts.
+  // If adapter omits or provides invalid list, default to all window artifacts deterministically.
+  const rawIds = core.evidence?.snapshotIds;
+  const filtered =
+    Array.isArray(rawIds) && rawIds.length > 0
+      ? rawIds.filter(id => typeof id === "string" && allowed.has(id))
+      : allowedIds;
+
+  // Preserve adapter ordering after filtering and remove duplicates.
+  const seen = new Set<string>();
+  const snapshotIds = filtered.filter(id => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+
+  const conservativeVerdict: VlmVerdict =
+    core.verdict === "PASS" || core.verdict === "FAIL" || core.verdict === "UNCERTAIN"
+      ? core.verdict
+      : "UNCERTAIN";
+  const verdict: VlmVerdict =
+    reasoningMode === "binary" && conservativeVerdict === "UNCERTAIN" ? "FAIL" : conservativeVerdict;
+  const unresolvedEvidence = hasUnresolvedEvidence(core);
+  const evidenceGapClassification = classifyEvidenceGaps(core);
+  const binaryObserved = reasoningMode === "binary" && conservativeVerdict !== "UNCERTAIN" && !unresolvedEvidence;
+  // Binary mode is a final-output contract: the visible verdict is PASS/FAIL.
+  // This label keeps the internal evidence state auditable without reintroducing
+  // UNCERTAIN as a final verdict.
+  const evidenceSupportLabel: VlmEvidenceSupportLabel =
+    conservativeVerdict === "PASS"
+      ? (binaryObserved || reasoningMode !== "binary" ? "OBSERVED_PASS" : "ASSUMED_PASS")
+      : conservativeVerdict === "FAIL"
+        ? (binaryObserved || reasoningMode !== "binary" ? "OBSERVED_FAIL" : "ASSUMED_FAIL")
+        : reasoningMode === "binary"
+          ? "ASSUMED_FAIL"
+          : "NOT_EVALUATED";
+  const rawVerdictBeforeBinaryCoercion: VlmVerdict | undefined =
+    conservativeVerdict !== verdict
+      ? conservativeVerdict
+      : reasoningMode === "binary" && evidenceSupportLabel.startsWith("ASSUMED_")
+        ? "UNCERTAIN"
+        : undefined;
+
+  const confidence =
+    typeof core.confidence === "number" && isFinite(core.confidence) ? clamp01(core.confidence) : 0.0;
+
+  const visibility = core.visibility ?? {
+    isRuleTargetVisible: false,
+    occlusionAssessment: "HIGH" as const,
+    missingEvidence: ["Adapter did not provide visibility; defaulted to conservative."],
+  };
+
+  const tokenUsage = core.meta?.tokenUsage
+    ? {
+        ...(typeof core.meta.tokenUsage.inputTokens === "number" && isFinite(core.meta.tokenUsage.inputTokens)
+          ? { inputTokens: core.meta.tokenUsage.inputTokens }
+          : {}),
+        ...(typeof core.meta.tokenUsage.outputTokens === "number" && isFinite(core.meta.tokenUsage.outputTokens)
+          ? { outputTokens: core.meta.tokenUsage.outputTokens }
+          : {}),
+        ...(typeof core.meta.tokenUsage.totalTokens === "number" && isFinite(core.meta.tokenUsage.totalTokens)
+          ? { totalTokens: core.meta.tokenUsage.totalTokens }
+          : {}),
+      }
+    : undefined;
+
+  return {
+    decisionId: crypto.randomUUID(),
+    timestampIso: new Date().toISOString(),
+    verdict,
+    confidence,
+    rationale: String(core.rationale ?? ""),
+    missingEvidence: Array.isArray((core as any).missingEvidence)
+      ? (core as any).missingEvidence.map((x: unknown) => String(x))
+      : Array.isArray(visibility.missingEvidence)
+        ? visibility.missingEvidence.map((x) => String(x))
+        : undefined,
+    evidenceRequirementsStatus:
+      core && typeof (core as any).evidenceRequirementsStatus === "object" && (core as any).evidenceRequirementsStatus
+        ? Object.fromEntries(
+            Object.entries((core as any).evidenceRequirementsStatus).filter(
+              ([, value]) => typeof value === "boolean"
+            )
+          ) as EvidenceRequirementsStatus
+        : undefined,
+    visibility: {
+      isRuleTargetVisible: Boolean(visibility.isRuleTargetVisible),
+      occlusionAssessment:
+        visibility.occlusionAssessment === "LOW" ||
+        visibility.occlusionAssessment === "MEDIUM" ||
+        visibility.occlusionAssessment === "HIGH"
+          ? visibility.occlusionAssessment
+          : "HIGH",
+      missingEvidence: Array.isArray(visibility.missingEvidence)
+        ? visibility.missingEvidence.map(x => String(x))
+        : undefined,
+    },
+    evidence: {
+      snapshotIds,
+      mode: (core.evidence?.mode as any) ?? input.artifacts[input.artifacts.length - 1].mode,
+      note: core.evidence?.note,
+    },
+followUp: isFollowUp(core.followUp) ? core.followUp : undefined,
+
+    meta: {
+      modelId: core.meta?.modelId ?? input.artifacts[input.artifacts.length - 1]?.meta.modelId ?? null,
+      promptHash: core.meta?.promptHash ?? hashPrompt(input.prompt),
+      provider: core.meta?.provider ?? provider,
+      followUpSource:
+        core.meta?.followUpSource === "model" ||
+        core.meta?.followUpSource === "provider_override" ||
+        core.meta?.followUpSource === "default_fallback"
+          ? core.meta.followUpSource
+          : undefined,
+      composedPromptText: input.prompt,
+      adapterPromptText: core.meta?.adapterPromptText,
+      inputSnapshotIds: input.artifacts.map((artifact) => artifact.id),
+      reasoningMode,
+      evidenceSupportLabel,
+      ...(rawVerdictBeforeBinaryCoercion ? { rawVerdictBeforeBinaryCoercion } : {}),
+      ...(evidenceGapClassification ? { evidenceGapClassification } : {}),
+      ...(tokenUsage && Object.keys(tokenUsage).length > 0 ? { tokenUsage } : {}),
+    },
+  };
+}
+
+/**
+ * Mock adapter used for deterministic end-to-end checks without provider calls.
+ */
+export function createMockVlmAdapter(): VlmAdapter {
+  return {
+    name: "mock",
+    async check({ prompt, artifacts }) {
+      const p = prompt.toLowerCase();
+      const last = artifacts[artifacts.length - 1];
+      const allIds = artifacts.map(a => a.id);
+      const isFirstStep = allIds.length === 1;
+
+      // Simple deterministic heuristics for smoke-testing the loop.
+      const wantsDoor = p.includes("door");
+      const wantsStairs = p.includes("stair");
+
+      if (isFirstStep) {
+        return {
+          verdict: "UNCERTAIN",
+          confidence: 0.35,
+          rationale: "Mock: first view often insufficient. Requesting a better viewpoint.",
+          visibility: {
+            isRuleTargetVisible: false,
+            occlusionAssessment: "HIGH",
+            missingEvidence: ["Need clearer viewpoint / less occlusion."],
+          },
+          evidence: {
+            snapshotIds: [last.id],
+            mode: last.mode,
+            note: last.meta.note,
+          },
+          followUp: wantsDoor
+            ? { request: "TOP_VIEW" }
+            : wantsStairs
+              ? { request: "ISO_VIEW" }
+              : { request: "NEW_VIEW", params: { reason: "Need a clearer viewpoint / less occlusion." } },
+          meta: {
+            modelId: last.meta.modelId,
+            promptHash: hashPrompt(prompt),
+            provider: "mock",
+          },
+        };
+      }
+
+      // Second+ snapshot: decide PASS with moderate confidence
+      return {
+        verdict: "PASS",
+        confidence: 0.72,
+        rationale: "Mock: sufficient evidence in later snapshot. Marking PASS for PoC.",
+        visibility: {
+          isRuleTargetVisible: true,
+          occlusionAssessment: "MEDIUM",
+        },
+        evidence: {
+          snapshotIds: allIds, // link all window snapshots to this decision
+          mode: last.mode,
+          note: last.meta.note,
+        },
+        meta: {
+          modelId: last.meta.modelId,
+          promptHash: hashPrompt(prompt),
+          provider: "mock",
+        },
+      };
+    },
+  };
+}
+
+export function createVlmChecker(
+  adapter: VlmAdapter,
+  options?: {
+    onWebEvidence?: (entry: WebEvidenceRecord) => void;
+    hasWebEvidenceForUrl?: (url: string) => boolean;
+    getProviderConfig?: () => ReducerProviderConfig;
+  }
+) {
+        async function fetchRegulatoryContextDirect(args: {
+        step: number;
+        url: string;
+        userIntent: string;
+        allowedDomains: string[];
+        maxChars?: number;
+      }): Promise<string | null> {
+        const { step, url, userIntent, allowedDomains } = args;
+        const maxChars = args.maxChars ?? DEFAULT_TAVILY_MAX_CHARS;
+
+        // Prefer Tavily
+        if (isTavilyAvailable()) {
+          console.log("[VLM] Direct prefetch via Tavily start:", { url });
+
+          const result = await webFetchViaTavily({
+            targetUrl: url,
+            userIntent,
+            allowedDomains,
+            maxChars,
+            cache: { enabled: true, ttlMs: 7 * 24 * 60 * 60 * 1000, persist: true },
+          });
+
+          let reducedText = "";
+          let reductionHeadings: string[] | undefined;
+          let reductionRationale: string | undefined;
+          let reductionError: string | undefined;
+
+          if (result.ok) {
+            const reduced = await reduceFetchedRegulatoryText({
+              ruleText: userIntent,
+              sourceUrl: result.url,
+              rawText: result.text ?? "",
+            });
+            reducedText = reduced.reducedText;
+            reductionHeadings = reduced.headings;
+            reductionRationale = reduced.rationale;
+            reductionError = reduced.error;
+          }
+
+          options?.onWebEvidence?.({
+            step,
+            sourceType: "WEB_FETCH",
+            url: result.url,
+            fetchedAt: new Date().toISOString(),
+            ok: result.ok,
+            chars: result.text?.length ?? 0,
+            fromCache: result.fromCache,
+            via: `tavily/${result.source}` as "tavily/extract" | "tavily/search",
+            text: result.text ?? "",
+            reducedText: reducedText || undefined,
+            reductionHeadings,
+            reductionRationale,
+            reductionError,
+            error: result.error,
+          });
+
+          console.log("[VLM] Direct prefetch via Tavily done:", {
+            ok: result.ok,
+            chars: result.text?.length ?? 0,
+            reducedChars: reducedText.length,
+            error: result.error,
+            reductionError,
+            fromCache: result.fromCache,
+            source: result.source,
+          });
+
+          if (result.ok) {
+            return (
+              `WEB_EVIDENCE:\n[source: ${result.url}]\n` +
+              `[via: tavily/${result.source}]\n` +
+              `${result.fromCache ? `[cache: ${result.fromCache}]\n` : ""}` +
+              `${reducedText}\n`
+            );
+          }
+        }
+
+        // Proxy fallback
+        if (WEB_FETCH_PROXY_BASE_URL) {
+          console.log("[VLM] Direct prefetch via proxy start:", { url, proxy: WEB_FETCH_PROXY_BASE_URL });
+
+          const result = await webFetchViaProxy({
+            targetUrl: url,
+            allowedDomains,
+            proxyBaseUrl: WEB_FETCH_PROXY_BASE_URL,
+            maxChars,
+            cache: { enabled: true, ttlMs: 7 * 24 * 60 * 60 * 1000, persist: true },
+          });
+
+          let reducedText = "";
+          let reductionHeadings: string[] | undefined;
+          let reductionRationale: string | undefined;
+          let reductionError: string | undefined;
+
+          if (result.ok) {
+            const reduced = await reduceFetchedRegulatoryText({
+              ruleText: userIntent,
+              sourceUrl: result.url,
+              rawText: result.text ?? "",
+            });
+            reducedText = reduced.reducedText;
+            reductionHeadings = reduced.headings;
+            reductionRationale = reduced.rationale;
+            reductionError = reduced.error;
+          }
+
+          options?.onWebEvidence?.({
+            step,
+            sourceType: "WEB_FETCH",
+            url: result.url,
+            fetchedAt: new Date().toISOString(),
+            ok: result.ok,
+            chars: result.text?.length ?? 0,
+            fromCache: result.fromCache,
+            via: "proxy",
+            text: result.text ?? "",
+            reducedText: reducedText || undefined,
+            reductionHeadings,
+            reductionRationale,
+            reductionError,
+            error: result.error,
+          });
+
+          console.log("[VLM] Direct prefetch via proxy done:", {
+            ok: result.ok,
+            chars: result.text?.length ?? 0,
+            reducedChars: reducedText.length,
+            error: result.error,
+            reductionError,
+            fromCache: result.fromCache,
+          });
+
+          if (result.ok) {
+            return (
+              `WEB_EVIDENCE:\n[source: ${result.url}]\n` +
+              `${result.fromCache ? `[cache: ${result.fromCache}]\n` : ""}` +
+              `${reducedText}\n`
+            );
+          }
+        }
+
+        return null;
+      }
+
+        async function reduceFetchedRegulatoryText(args: {
+          ruleText: string;
+          sourceUrl: string;
+          rawText: string;
+        }): Promise<{
+          reducedText: string;
+          headings?: string[];
+          rationale?: string;
+          error?: string;
+        }> {
+          const cfg = options?.getProviderConfig?.();
+
+          if (cfg?.provider === "openrouter" && cfg.openrouter?.apiKey && cfg.openrouter?.model) {
+            const reduced = await reduceRegulatoryTextWithOpenRouter({
+              apiKey: String(cfg.openrouter.apiKey),
+              model: String(cfg.openrouter.model),
+              endpoint: cfg.openrouter.endpoint,
+              requestTimeoutMs: cfg.openrouter.requestTimeoutMs,
+              appTitle: cfg.openrouter.appTitle,
+              appReferer: cfg.openrouter.appReferer,
+              input: {
+                ruleText: args.ruleText,
+                sourceUrl: args.sourceUrl,
+                rawText: args.rawText,
+                maxChars: getPrototypeRuntimeSettings().reducedTavilyMaxChars,
+              },
+            });
+
+            if (reduced.ok) {
+              return {
+                reducedText: reduced.reducedText,
+                headings: reduced.headings,
+                rationale: reduced.rationale,
+              };
+            }
+
+            return {
+              reducedText: args.rawText.slice(0, getPrototypeRuntimeSettings().reducedTavilyMaxChars),
+              error: reduced.error,
+            };
+          }
+
+          return {
+            reducedText: args.rawText.slice(0, getPrototypeRuntimeSettings().reducedTavilyMaxChars),
+            error: "No reducer provider configured; used truncated raw text.",
+          };
+        }
+
+  return {
+    adapterName: adapter.name,
+
+    async check(input: VlmCheckInput): Promise<VlmDecision> {
+      const norm0 = normalizeInput(input);
+
+      // Keep original user prompt stable; accumulate regulatory context deterministically.
+      const userIntent = norm0.prompt;
+      const promptSource = inferPromptSource(userIntent);
+      const promptGrounding = assessPromptRegulatoryGrounding(userIntent);
+      const allowGeneralWebGrounding = promptSource !== "rule_library";
+      let regulatoryContext = "";
+      const fetchedUrls = new Set<string>();
+
+      const allowedDomains = extractAllowedDomainsFromPrompt(userIntent) ?? DEFAULT_ALLOWED_DOMAINS;
+
+      // Run at most 2 iterations: initial decision + (optional) one WEB_FETCH grounding pass.
+      for (let step = 0; step < 3; step++) {
+        let composedPrompt = composePromptWithRegulatoryContext({
+          userIntent,
+          regulatoryContext,
+          allowedDomains,
+          promptSource,
+        });
+
+        // Deterministic prefetch: do not rely on the model to request WEB_FETCH first.
+        if (
+          promptGrounding.requiresExternalFetchByDefault &&
+          step === 0 &&
+          !regulatoryContext.trim() &&
+          allowedDomains.length > 0
+        ) {
+          const prefetchUrl = guessIccEntrypointUrl(userIntent, allowedDomains);
+
+          if (
+            prefetchUrl &&
+            !fetchedUrls.has(prefetchUrl) &&
+            !options?.hasWebEvidenceForUrl?.(prefetchUrl)
+          ) {
+            fetchedUrls.add(prefetchUrl);
+
+            const injected = await fetchRegulatoryContextDirect({
+              step,
+              url: prefetchUrl,
+              userIntent,
+              allowedDomains,
+              maxChars: DEFAULT_TAVILY_MAX_CHARS,
+             });
+
+            if (injected) {
+              regulatoryContext = (regulatoryContext ? regulatoryContext + "\n\n" : "") + injected;
+            } else {
+              composedPrompt +=
+                "\n\nSYSTEM_NOTE:\n" +
+                "The requirement is vague / missing thresholds. Prioritize WEB_FETCH first to retrieve the authoritative clause text from AllowedSources.\n" +
+                "If you don’t know the section URL yet, fetch a relevant code TOC/chapter page first.\n";
+            }
+          } else {
+            composedPrompt +=
+              "\n\nSYSTEM_NOTE:\n" +
+              "The requirement is vague / missing thresholds. Prioritize WEB_FETCH first to retrieve the authoritative clause text from AllowedSources.\n" +
+              "If you don’t know the section URL yet, fetch a relevant code TOC/chapter page first.\n";
+          }
+
+          composedPrompt = composePromptWithRegulatoryContext({
+            userIntent,
+            regulatoryContext,
+            allowedDomains,
+            promptSource,
+          });
+        }
+        const norm: VlmCheckInput = { ...norm0, prompt: composedPrompt };
+        const core = await adapter.check(norm);
+
+        // WEB_FETCH follow-up logic.
+        // Execute one internal fetch-and-rerun cycle when the model asks for it.
+                const fu = isFollowUp(core.followUp) ? core.followUp : undefined;
+        if (core.verdict === "UNCERTAIN" && fu?.request === "WEB_FETCH") {
+          const explicitSupplementalRegulatoryGap = hasExplicitRegulatoryGapText([
+            core.rationale,
+            ...(core.missingEvidence ?? []),
+            ...(core.visibility?.missingEvidence ?? []),
+          ]);
+          const allowRuleLibrarySupplementalWebGrounding =
+            promptSource === "rule_library" &&
+            (!promptGrounding.hasUsableLocalGrounding || explicitSupplementalRegulatoryGap);
+
+          if (!allowGeneralWebGrounding && !allowRuleLibrarySupplementalWebGrounding) {
+            const patched = {
+              ...core,
+              followUp: {
+                request: "NEW_VIEW",
+                params: { reason: "Supplemental WEB_FETCH is not justified because local ruleLibrary context already grounds this predefined rule." },
+              } as VlmFollowUp,
+              rationale:
+                (core.rationale ? core.rationale + " " : "") +
+                "Local ruleLibrary context already provides regulatory grounding for this predefined rule, so no external web fetch was justified.",
+            };
+            return finalizeDecision(patched as any, norm, adapter.name);
+          }
+          console.log("[VLM] WEB_FETCH requested. raw params:", fu.params);
+
+          let url = (fu.params as any)?.url as string | undefined;
+
+          // Fallback if model forgot url
+          if (!url) {
+            url = guessIccEntrypointUrl(userIntent, allowedDomains) ?? undefined;
+            console.log("[VLM] WEB_FETCH missing url; fallback entrypoint:", url);
+          }
+
+          if (!url) {
+            const patched = {
+              ...core,
+              followUp: {
+                request: "NEW_VIEW",
+                params: { reason: "WEB_FETCH requested but no url provided and no fallback entrypoint available." },
+              } as VlmFollowUp,
+            };
+            return finalizeDecision(patched as any, norm, adapter.name);
+          }
+
+          if (fetchedUrls.has(url)) {
+            const patched = {
+              ...core,
+              followUp: { request: "NEW_VIEW", params: { reason: "Regulatory source already fetched; need better model evidence now." } } as VlmFollowUp,
+              rationale:
+                (core.rationale ? core.rationale + " " : "") +
+                "Regulatory source already fetched in this run; further progress requires better visual evidence, not another web fetch.",
+            };
+            return finalizeDecision(patched as any, norm, adapter.name);
+          }
+          fetchedUrls.add(url);
+
+          const maxChars = (fu.params as any)?.maxChars ?? DEFAULT_TAVILY_MAX_CHARS;
+
+          // 1) Prefer Tavily for URL-grounded fetch/extract
+          if (isTavilyAvailable()) {
+            console.log("[VLM] WEB_FETCH via Tavily start:", { url });
+
+            const t0 = performance.now();
+            const result = await webFetchViaTavily({
+              targetUrl: url,
+              userIntent,
+              allowedDomains,
+              maxChars,
+              cache: { enabled: true, ttlMs: 7 * 24 * 60 * 60 * 1000, persist: true },
+            });
+
+            let reducedText = "";
+            let reductionHeadings: string[] | undefined;
+            let reductionRationale: string | undefined;
+            let reductionError: string | undefined;
+
+            if (result.ok) {
+              const reduced = await reduceFetchedRegulatoryText({
+                ruleText: userIntent,
+                sourceUrl: result.url,
+                rawText: result.text ?? "",
+              });
+              reducedText = reduced.reducedText;
+              reductionHeadings = reduced.headings;
+              reductionRationale = reduced.rationale;
+              reductionError = reduced.error;
+            }
+
+            options?.onWebEvidence?.({
+              step,
+              sourceType: "WEB_FETCH",
+              url: result.url,
+              fetchedAt: new Date().toISOString(),
+              ok: result.ok,
+              chars: result.text?.length ?? 0,
+              fromCache: result.fromCache,
+              via: `tavily/${result.source}` as "tavily/extract" | "tavily/search",
+              text: result.text ?? "",
+              reducedText: reducedText || undefined,
+              reductionHeadings,
+              reductionRationale,
+              reductionError,
+              error: result.error,
+            });
+
+            console.log("[VLM] WEB_FETCH via Tavily done:", {
+              ok: result.ok,
+              ms: Math.round(performance.now() - t0),
+              chars: result.text?.length ?? 0,
+              reducedChars: reducedText.length,
+              error: result.error,
+              reductionError,
+              fromCache: result.fromCache,
+              source: result.source,
+            });
+
+            if (result.ok) {
+              const injected =
+                `WEB_EVIDENCE:\n[source: ${result.url}]\n` +
+                `[via: tavily/${result.source}]\n` +
+                `${result.fromCache ? `[cache: ${result.fromCache}]\n` : ""}` +
+                `${reducedText}\n`;
+
+              regulatoryContext = (regulatoryContext ? regulatoryContext + "\n\n" : "") + injected;
+              continue;
+            }
+
+            console.warn("[VLM] Tavily fetch failed; falling back to proxy.", result.error);
+          }
+
+          // 2) Optional proxy fallback
+          if (!WEB_FETCH_PROXY_BASE_URL) {
+            // Final soft fallback: broad Tavily search context if available
+            if (isTavilyAvailable()) {
+              console.log("[VLM] No proxy configured; using Tavily search fallback.");
+              const searchQuery = `site:${new URL(url).hostname} ${userIntent}`;
+              const tavilyResult = await searchRuleContext(searchQuery).catch(() => null);
+              if (tavilyResult && tavilyResult.results.length > 0) {
+                for (const r of tavilyResult.results) {
+                  options?.onWebEvidence?.({
+                    step,
+                    sourceType: "TAVILY_SEARCH",
+                    url: r.url,
+                    fetchedAt: new Date().toISOString(),
+                    ok: true,
+                    chars: (r.rawContent ?? r.content ?? "").length,
+                    via: "tavily/search",
+                    query: tavilyResult.query,
+                    title: r.title,
+                    text: r.rawContent ?? r.content ?? "",
+                  });
+                }
+              }
+            }
+
+            
+            const patched = {
+              ...core,
+              followUp: undefined,
+              rationale:
+                (core.rationale ? core.rationale + " " : "") +
+                "WEB_FETCH failed and no proxy is configured (VITE_WEB_FETCH_PROXY_URL).",
+            };
+            
+            return finalizeDecision(patched as any, norm, adapter.name);
+          }
+
+          console.log("[VLM] WEB_FETCH via proxy start:", { url, proxy: WEB_FETCH_PROXY_BASE_URL });
+          const t0 = performance.now();
+
+          const result = await webFetchViaProxy({
+            targetUrl: url,
+            allowedDomains,
+            proxyBaseUrl: WEB_FETCH_PROXY_BASE_URL,
+            maxChars,
+            cache: { enabled: true, ttlMs: 7 * 24 * 60 * 60 * 1000, persist: true },
+          });
+
+                    options?.onWebEvidence?.({
+            step,
+            sourceType: "WEB_FETCH",
+            url: result.url,
+            fetchedAt: new Date().toISOString(),
+            ok: result.ok,
+            chars: result.text?.length ?? 0,
+            fromCache: result.fromCache,
+            via: "proxy",
+            text: result.text ?? "",
+            error: result.error,
+          });
+
+          console.log("[VLM] WEB_FETCH via proxy done:", {
+            ok: result.ok,
+            ms: Math.round(performance.now() - t0),
+            chars: result.text?.length ?? 0,
+            error: result.error,
+            fromCache: (result as any).fromCache,
+          });
+
+          const injected = result.ok
+            ? `WEB_EVIDENCE:\n[source: ${result.url}]\n${(result as any).fromCache ? `[cache: ${(result as any).fromCache}]\n` : ""}${result.text}\n`
+            : `WEB_EVIDENCE_ERROR:\n[source: ${result.url}]\n${result.error}\n`;
+
+          regulatoryContext = (regulatoryContext ? regulatoryContext + "\n\n" : "") + injected;
+          continue;
+        }
+
+        // Normal path: finalize now.
+        return finalizeDecision(core, norm, adapter.name);
+      }
+
+
+// Should not reach here; fallback conservative.
+    const composedPrompt = composePromptWithRegulatoryContext({
+      userIntent,
+      regulatoryContext,
+      allowedDomains,
+      promptSource,
+    });
+    const norm: VlmCheckInput = { ...norm0, prompt: composedPrompt };
+    const fallbackCore = await adapter.check(norm);
+    return finalizeDecision(fallbackCore, norm, adapter.name);
+    },
+
+  };
+}

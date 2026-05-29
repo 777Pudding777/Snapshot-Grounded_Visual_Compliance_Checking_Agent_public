@@ -1,0 +1,27 @@
+{
+  "name": "Case-study evaluation",
+  "description": "Configuration snapshot for the case-study traces and reports stored under evaluation/reports/3_case-study.",
+  "reportDirectory": "evaluation/reports/3_case-study",
+  "sceneDirectory": "evaluation/scenes/ifc/Case_Study",
+  "traceCount": 3,
+  "reasoningMode": "binary",
+  "allowedVerdicts": ["PASS", "FAIL"],
+  "modelsEvaluated": [
+    "anthropic/claude-sonnet-4.6",
+    "openai/gpt-5.4"
+  ],
+  "rulesEvaluated": [
+    "VLM-ACC-DOOR-001",
+    "VLM-ACC-STAIR-001"
+  ],
+  "runtimeSettings": {
+    "maxComplianceSteps": 5,
+    "maxSnapshotsPerRequest": 5,
+    "useCompactVlmContext": true,
+    "planCutFollowUpsEnabled": false
+  },
+  "notes": [
+    "This subset uses the multi-rule case-study scene rather than the isolated synthetic rule scenes.",
+    "The trace JSON files remain the authoritative record for the exact prompts, model calls, and final results."
+  ]
+}

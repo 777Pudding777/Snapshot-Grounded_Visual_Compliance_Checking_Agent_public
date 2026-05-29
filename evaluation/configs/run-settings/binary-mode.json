@@ -1,0 +1,29 @@
+{
+  "name": "Binary evaluation mode",
+  "description": "Configuration snapshot for traces and reports stored under evaluation/reports/1_binary_mode.",
+  "reportDirectory": "evaluation/reports/1_binary_mode",
+  "traceCount": 64,
+  "reasoningMode": "binary",
+  "allowedVerdicts": ["PASS", "FAIL"],
+  "modelsEvaluated": [
+    "anthropic/claude-sonnet-4.6",
+    "openai/gpt-5.4",
+    "openai/gpt-5.5",
+    "moonshotai/kimi-k2.5"
+  ],
+  "runtimeSettings": {
+    "maxComplianceSteps": 5,
+    "maxSnapshotsPerRequest": 5,
+    "useCompactVlmContext": true,
+    "planCutFollowUpsEnabled": false,
+    "entityUncertainTerminationSteps": 5,
+    "entityUncertainTerminationConfidence": 0.85,
+    "orbitMaxHighlightOcclusionRatio": 0.2,
+    "snapshotNoveltyRedundancyThreshold": 0.2
+  },
+  "notes": [
+    "Binary mode forces the final verdict to PASS or FAIL even when evidence is incomplete.",
+    "The trace JSON files remain the authoritative record of prompts, snapshots, selected rule, model, timestamps, and final outputs.",
+    "No API keys or local environment values are required to interpret this configuration snapshot."
+  ]
+}
