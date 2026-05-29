@@ -1,4 +1,4 @@
-# Snapshot_grounded_visual_compliance_checking_agent_thesis
+# Snapshot-Grounded Visual Compliance Checking Agent
 A modular TypeScript prototype for visual BIM compliance checking with vision-language models. The app loads IFC models, navigates the 3D scene, captures evidence snapshots, evaluates selected rules with configurable VLM providers, and stores traces/reports for later analysis.
 
 ## Features
